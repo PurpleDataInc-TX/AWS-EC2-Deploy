@@ -1,0 +1,144 @@
+
+{ 
+
+  "Version": "2012-10-17", 
+
+  "Statement": [ 
+
+    { 
+
+      "Effect": "Allow", 
+
+      "Action": [ 
+
+        "s3:GetObject", 
+
+        "s3:PutObject", 
+
+        "s3:DeleteObject", 
+
+        "s3:ListBucket", 
+
+        "s3:GetBucketLocation" 
+
+      ], 
+
+      "Resource": [ 
+
+        "arn:aws:s3:::venkat-databricks-cloudpi-billing", 
+
+        "arn:aws:s3:::venkat-databricks-cloudpi-billing/*" 
+
+      ] 
+
+    } 
+
+  ] 
+
+} 
+
+EOF 
+
+ 
+
+cat > cloudpi-billing-trust-policy.json <<EOF 
+
+{ 
+
+  "Version": "2012-10-17", 
+
+  "Statement": [ 
+
+    { 
+
+      "Effect": "Allow", 
+
+      "Principal": { 
+
+        "AWS": "arn:aws:iam::718959508207:root" 
+
+      }, 
+
+      "Action": "sts:AssumeRole" 
+
+    } 
+
+  ] 
+
+} 
+
+EOF 
+
+ 
+
+echo "Creating IAM role..." 
+
+aws iam create-role \ 
+
+  --role-name "cloudpi-ec2-role" \ 
+
+  --assume-role-policy-document file://cloudpi-billing-trust-policy.json || true 
+
+ 
+
+echo "Attaching S3 access policy..." 
+
+aws iam put-role-policy \ 
+
+  --role-name "cloudpi-ec2-role" \ 
+
+  --policy-name cloudpi-billing-s3-access \ 
+
+  --policy-document file://cloudpi-billing-s3-policy.json 
+
+ 
+
+ROLE_ARN=arn:aws:iam::718959508207:role/cloudpi-ec2-role 
+
+ 
+
+echo "" 
+
+echo "AWS setup complete." 
+
+echo "Role ARN: " 
+
+echo "S3 Bucket: venkat-databricks-cloudpi-billing" 
+
+echo "Folder Path: org=1/cloud=aws/source=system_tables" 
+
+echo "" 
+
+echo "Next manual Databricks steps:" 
+
+echo "1. Create Databricks Storage Credential using this Role ARN:" 
+
+echo "   " 
+
+echo "2. Copy the Databricks-generated trust policy." 
+
+echo "3. Update IAM role trust relationship in AWS." 
+
+echo "4. Create External Location:" 
+
+echo "   s3://venkat-databricks-cloudpi-billing/" 
+
+echo "5. Create export notebook/job." 
+
+echo "6. Run export once." 
+
+echo "" 
+
+echo "CloudPi onboarding values:" 
+
+echo "Underlying cloud: AWS" 
+
+echo "Export type: DATABRICKS_SYSTEM_TABLES" 
+
+echo "S3 Bucket Name: venkat-databricks-cloudpi-billing" 
+
+echo "Folder Path: org=1/cloud=aws/source=system_tables" 
+
+echo "File Format: PARQUET_SNAPPY" 
+
+echo "Region: us-east-1" 
