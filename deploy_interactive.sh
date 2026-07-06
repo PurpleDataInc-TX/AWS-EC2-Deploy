@@ -757,8 +757,16 @@ header 6 "Provision EC2 Infrastructure"
 PUBLIC_IP="$(st_get PUBLIC_IP)"
 
 if should_run STEP_6 "EC2 provisioned (IP: ${PUBLIC_IP:-none})"; then
-    echo "     This creates: IAM role, security group (22/80/443),"
-    echo "     EC2 t3.large + 30 GB gp3, and an Elastic IP — in region ${REGION}."
+    # Disk sizing. The 30 GB root holds the OS only; the CloudPi app AND all
+    # Docker data (images/containers/volumes, incl. the MySQL volume) live on a
+    # separate data disk mounted at /data, so the root never fills up.
+    _root_gb="${ROOT_VOLUME_SIZE:-30}"
+    ask _data_gb "Data disk size in GB (app + Docker + DB, mounted at /data)" "64"
+    [[ "$_data_gb" =~ ^[0-9]+$ ]] || { warn "Not a number — using 64 GB."; _data_gb=64; }
+
+    echo "     This creates: IAM role, security group (22/80/443), EC2 t3.large,"
+    echo "     a ${_root_gb} GB root (OS) + ${_data_gb} GB data disk (/data), and an Elastic IP"
+    echo "     — in region ${REGION}."
     echo
     echo "     Options:"
     echo "       1) Run deploy_aws_ec2.py now  (default)"
@@ -766,10 +774,12 @@ if should_run STEP_6 "EC2 provisioned (IP: ${PUBLIC_IP:-none})"; then
     ask _popt "Choice" "1"
 
     if [[ "${_popt:-1}" == "1" ]]; then
-        info "Running deploy_aws_ec2.py in region ${REGION} (TF: ${TF_SCRIPT}) ..."
-        # REGION and TF_SCRIPT are exported so deploy_aws_ec2.py branches correctly.
+        info "Running deploy_aws_ec2.py in region ${REGION} (data disk: ${_data_gb} GB) ..."
+        # REGION/TF_SCRIPT/DATA_VOLUME_SIZE are exported so deploy_aws_ec2.py
+        # provisions the right infra and data-disk size.
         TF_SCRIPT="$(st_get TF_SCRIPT)"
-        _out=$(REGION="$REGION" TF_SCRIPT="$TF_SCRIPT" python3 "$SCRIPT_DIR/deploy_aws_ec2.py" 2>&1 | tee /dev/stderr)
+        _out=$(REGION="$REGION" TF_SCRIPT="$TF_SCRIPT" DATA_VOLUME_SIZE="$_data_gb" \
+               python3 "$SCRIPT_DIR/deploy_aws_ec2.py" 2>&1 | tee /dev/stderr)
         PUBLIC_IP=$(echo "$_out" | grep -E "Public IP" | head -1 | awk '{print $NF}')
         [[ -n "$PUBLIC_IP" ]] || die "Could not capture Public IP from deploy_aws_ec2.py output."
     else
@@ -1039,9 +1049,9 @@ if should_run STEP_10C "docker-compose.yml configured"; then
     ssh_run "grep 'image:' /home/cloudpiadmin/cloudpi/docker-compose.yml 2>/dev/null || echo '     (none found)'"
     echo
     echo "     Options:"
-    echo "       1) Generate new docker-compose.yml from template  (default)"
+    echo "       1) Install bundle docker-compose.yml (from cloudpi-files, version-tagged)  (default)"
     echo "       2) Update image tags only in existing docker-compose.yml"
-    echo "       3) Skip"
+    echo "       3) Skip (keep whatever is already on the instance)"
     ask _copt "Choice" "1"
 
     if [[ "${_copt:-1}" == "3" ]]; then
@@ -1066,77 +1076,25 @@ grep 'image:' "$FILE"
 REMOTE
             ok "Image tags updated to ${_ver}."
         else
+            # Install the canonical bundle compose (single source of truth) with
+            # the chosen version applied — NOT a divergent inline template. This
+            # keeps the volume names (mysql_data / redis_data / cloudpi) identical
+            # to the bundle, so the DB volume never diverges and billing data in
+            # cloudpi_mysql_data is never stranded by a name mismatch.
+            _bundle_compose="$SCRIPT_DIR/cloudpi-files/docker-compose.yml"
+            [[ -f "$_bundle_compose" ]] || die "Bundle compose not found: $_bundle_compose"
             _compose_tmp=$(mktemp /tmp/cloudpi-compose.XXXXXX.yml)
-            cat > "$_compose_tmp" <<COMPOSE
-version: "3.8"
-
-secrets:
-  cloudpi_secrets:
-    file: /run/secrets-tmp/cloudpi.secrets
-  db_password:
-    file: /run/secrets-tmp/db_password
-  db_root_password:
-    file: /run/secrets-tmp/db_root_password
-
-services:
-  db:
-    image: cloudpi1/cloudpi:Cloudpi_db_${_ver}
-    container_name: cloudpi-db
-    restart: unless-stopped
-    env_file:
-      - .env
-      - /run/secrets-tmp/cloudpi.secrets
-    volumes:
-      - cloudpi_db_data:/var/lib/mysql
-    networks:
-      - cloudpi_network
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  app:
-    image: cloudpi1/cloudpi:Cloudpi_${_ver}
-    container_name: cloudpi-app
-    restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-    env_file:
-      - .env
-      - /run/secrets-tmp/cloudpi.secrets
-    secrets:
-      - cloudpi_secrets
-    volumes:
-      - ./certs:/home/certs
-      - cloudpi_backups:/app/backups
-    ports:
-      - "80:80"
-      - "443:443"
-    networks:
-      - cloudpi_network
-    healthcheck:
-      test: ["CMD", "curl", "-fsk", "https://localhost/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
-
-volumes:
-  cloudpi_db_data:
-  cloudpi_backups:
-
-networks:
-  cloudpi_network:
-    driver: bridge
-COMPOSE
-
+            cp "$_bundle_compose" "$_compose_tmp"
+            # Apply ${_ver} to both image tags (db first, then app). -i.bak works
+            # on both macOS and GNU sed; the backup is removed immediately after.
+            sed -i.bak "s|cloudpi1/cloudpi:Cloudpi_db_[A-Za-z0-9._-]*|cloudpi1/cloudpi:Cloudpi_db_${_ver}|g" "$_compose_tmp"
+            sed -i.bak "/Cloudpi_db_/!s|cloudpi1/cloudpi:Cloudpi_[A-Za-z0-9._-]*|cloudpi1/cloudpi:Cloudpi_${_ver}|g" "$_compose_tmp"
+            rm -f "${_compose_tmp}.bak"
             scp_up "$_compose_tmp" "/tmp/docker-compose.yml"
             rm -f "$_compose_tmp"
             ssh_run "sudo mv /tmp/docker-compose.yml /home/cloudpiadmin/cloudpi/docker-compose.yml && \
                      sudo chown cloudpiadmin:cloudpiadmin /home/cloudpiadmin/cloudpi/docker-compose.yml"
-            ok "docker-compose.yml generated (version: ${_ver})."
+            ok "docker-compose.yml installed from bundle (version: ${_ver})."
         fi
     fi
     st_set STEP_10C "done"
