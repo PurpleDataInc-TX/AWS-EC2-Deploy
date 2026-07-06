@@ -987,8 +987,10 @@ if [ -e "$DEST/docker-compose.yml" ]; then
     echo "     CloudPi files already present — skipping clone."
 else
     TMP=$(sudo -u cloudpiadmin mktemp -d)
+    # Capture stderr so a clone failure is visible (repo private/renamed, no
+    # network, etc.) instead of silently falling through to generated files.
     if sudo -u cloudpiadmin git clone --depth 1 \
-         https://github.com/PurpleDataInc-TX/AWS_EC2-Deploy.git "$TMP/repo" 2>/dev/null; then
+         https://github.com/PurpleDataInc-TX/2AWS-EC-Deploy.git "$TMP/repo" 2>"$TMP/clone.err"; then
         # The APP BUNDLE lives in the repo's cloudpi-files/ subdir. Copy ONLY that
         # (not the deploy toolkit at the repo root — deploy_interactive.sh, the
         # .py scripts, Install from EC2/, etc.) so the app dir stays clean and the
@@ -1002,10 +1004,13 @@ else
         else
             echo "     WARNING: no docker-compose.yml in the repo — steps 10c/10d will generate one."
         fi
-        sudo rm -rf "$TMP"
     else
-        echo "     (git clone failed — generated files in steps 10c/10d will be used.)"
+        echo "     git clone FAILED:"
+        sed 's/^/         /' "$TMP/clone.err" 2>/dev/null || true
+        echo "     → Fix the repo URL/access, OR re-run and choose install type 3"
+        echo "       (upload local cloudpi-files) which needs no GitHub access."
     fi
+    sudo rm -rf "$TMP"
 fi
 REMOTE
         ok "CloudPi directory ready."
