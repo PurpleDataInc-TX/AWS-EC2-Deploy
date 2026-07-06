@@ -24,9 +24,9 @@ TOTAL_STEPS=12
 # ── Colors / formatting ─────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-    BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+    CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 else
-    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; NC=''
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; NC=''
 fi
 
 TERM_COLS=$(tput cols 2>/dev/null || echo 70)
@@ -187,6 +187,107 @@ scp_up() {    # scp_up local_file remote_path
     scp -i "$KEY_FILE" "${SSH_OPTS[@]}" "$1" "cloudpiadmin@${PUBLIC_IP}:$2"
 }
 
+# ── Remediation helpers (shared by step 10 setup and step 11 auto-repair) ─────
+# These are idempotent and safe to call repeatedly; the step-11 health loop
+# calls them automatically when it detects the matching failure signature, so a
+# transient/first-boot problem self-heals without a manual re-run.
+
+# ensure_log_dir — create /var/log/pico writable by the in-container app (UID
+# 1000). Missing/root-owned dir makes Flask crash-loop on 'PermissionError'.
+ensure_log_dir() {
+    ssh_run "sudo mkdir -p /var/log/pico && { sudo chown -R 1000:syslog /var/log/pico 2>/dev/null || sudo chown -R 1000:1000 /var/log/pico; } && sudo chmod 2750 /var/log/pico"
+}
+
+# restart_fetch_secrets — re-pull secrets into tmpfs and re-apply the stack.
+restart_fetch_secrets() {
+    ssh_run "sudo systemctl restart cloudpi-fetch-secrets && cd /home/cloudpiadmin/cloudpi && sudo docker compose up -d"
+}
+
+# reconcile_db_password — make the DB's masteradmin/root passwords match the
+# secrets. The prebuilt cloudpi-db image ships a PRE-INITIALIZED datadir, so
+# MySQL ignores the MYSQL_* env vars on first boot and the baked-in password
+# (unknown to us) sticks — the app then fails with "Access denied" forever
+# (while the DB still reports 'healthy', since mysqladmin ping doesn't auth).
+# We probe the app's exact auth path; only if it fails do we bounce the datadir
+# through a throwaway mysqld with --skip-grant-tables and force the passwords.
+reconcile_db_password() {
+    ssh_in "REGION='$REGION' bash -s" <<'REMOTE'
+set -euo pipefail
+APP_DIR=/home/cloudpiadmin/cloudpi
+
+# Pull the credentials the app will use, straight from Secrets Manager.
+SM=$(/usr/local/bin/aws secretsmanager get-secret-value \
+    --region "$REGION" --secret-id cloudpi-secrets \
+    --query SecretString --output text)
+DB_PW=$(printf   '%s' "$SM" | python3 -c "import json,sys; print(json.load(sys.stdin)['MYSQL_PASSWORD'])")
+DB_ROOT=$(printf '%s' "$SM" | python3 -c "import json,sys; print(json.load(sys.stdin).get('MYSQL_ROOT_PASSWORD',''))")
+APP_USER=$(printf '%s' "$SM" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('DB_USER') or d.get('MYSQL_USER') or 'masteradmin')")
+
+# Wait for the db container to exist (compose was just started).
+for i in $(seq 1 30); do
+    sudo docker ps --format '{{.Names}}' | grep -qx cloudpi-db && break
+    sleep 2
+done
+
+# Discover the real volume / network / image from the running container so this
+# never drifts from the compose project name.
+VOL=$(sudo docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Name}}{{end}}{{end}}' cloudpi-db)
+NET=$(sudo docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' cloudpi-db)
+IMG=$(sudo docker inspect -f '{{.Config.Image}}' cloudpi-db)
+[ -n "$VOL" ] || { echo "ERROR: could not resolve the mysql data volume"; exit 1; }
+
+# Probe the app's exact path: TCP as APP_USER@'%' to host cloudpi-db.
+if sudo docker run --rm --network "$NET" -e MYSQL_PWD="$DB_PW" --entrypoint mysql "$IMG" \
+       -u "$APP_USER" -h cloudpi-db -e "SELECT 1" >/dev/null 2>&1; then
+    echo "OK: '$APP_USER' authenticates over the network — no reset needed."
+    exit 0
+fi
+
+echo "Auth failed — resetting DB passwords to match secrets (skip-grant-tables) ..."
+# Escape single quotes for SQL string literals (double them).
+APP_USER_SQL=${APP_USER//\'/\'\'}
+DB_PW_SQL=${DB_PW//\'/\'\'}
+DB_ROOT_SQL=${DB_ROOT//\'/\'\'}
+
+cd "$APP_DIR"
+sudo docker compose stop db
+
+# Never leave a stale reset container around.
+sudo docker rm -f mysql-reset >/dev/null 2>&1 || true
+sudo docker run --rm -d --name mysql-reset \
+    -v "$VOL":/var/lib/mysql --user mysql --entrypoint mysqld \
+    "$IMG" --skip-grant-tables --skip-networking
+
+# Wait for the throwaway mysqld to accept local connections.
+for i in $(seq 1 30); do
+    sudo docker exec mysql-reset mysqladmin ping >/dev/null 2>&1 && break
+    sleep 2
+done
+
+sudo docker exec mysql-reset mysql -e "
+FLUSH PRIVILEGES;
+ALTER USER IF EXISTS '${APP_USER_SQL}'@'%'         IDENTIFIED BY '${DB_PW_SQL}';
+ALTER USER IF EXISTS '${APP_USER_SQL}'@'localhost' IDENTIFIED BY '${DB_PW_SQL}';
+ALTER USER IF EXISTS 'root'@'localhost'            IDENTIFIED BY '${DB_ROOT_SQL}';
+FLUSH PRIVILEGES;
+"
+sudo docker stop mysql-reset >/dev/null 2>&1 || true
+
+# Bring the real stack back up and re-probe.
+sudo docker compose up -d
+for i in $(seq 1 30); do
+    sudo docker ps --format '{{.Names}}' | grep -qx cloudpi-db && break
+    sleep 2
+done
+if sudo docker run --rm --network "$NET" -e MYSQL_PWD="$DB_PW" --entrypoint mysql "$IMG" \
+       -u "$APP_USER" -h cloudpi-db -e "SELECT 1" >/dev/null 2>&1; then
+    echo "OK: password reset succeeded — '$APP_USER' now authenticates."
+else
+    echo "ERROR: reset ran but '$APP_USER' still cannot authenticate."; exit 1
+fi
+REMOTE
+}
+
 # Placeholders so `set -u` doesn't complain before steps 5/6 populate them
 KEY_FILE=""; PUBLIC_IP=""; REGION="us-east-1"
 
@@ -293,7 +394,7 @@ if should_run STEP_3 "pip install boto3 cryptography"; then
     with_spinner "Installing boto3 + cryptography" \
         pip3 install --quiet boto3 cryptography \
         || die "pip install failed — see output above."
-    st_set STEP_3 done
+    st_set STEP_3 "done"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -421,7 +522,7 @@ PYEOF
         ok "Fernet keys valid (PAR_SECRET_KEY, ENCRYPTION_KEY, CREDENTIAL_ENCRYPTION_KEY)."
     fi
 
-    st_set STEP_4 done
+    st_set STEP_4 "done"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -534,11 +635,13 @@ else
     echo "       1) ${_rl}  (recommended)"
     echo "       2) Create a BRAND-NEW pair — deletes any existing AWS '$KEY_PAIR_NAME' and overwrites local .pem"
     echo "       3) Use a different existing .pem file"
+    echo "       4) Use a different key pair name (currently: '$KEY_PAIR_NAME')"
     ask _kopt "Choice" "1"
 fi
 case "${_kopt:-1}" in
     2) _action=recreate ;;
     3) _action=path ;;
+    4) _action=rename ;;
     *) _action="$_rec" ;;
 esac
 
@@ -570,6 +673,7 @@ case "$_action" in
     path)
         ask KEY_FILE "Path to .pem file"
         KEY_FILE="${KEY_FILE/#\~/$HOME}"
+        KEY_FILE="${KEY_FILE//.pem.pem/.pem}"   # collapse an accidental double .pem
         [[ -f "$KEY_FILE" ]] || die "File not found: $KEY_FILE"
         _lpub="$(_local_pubkey)"; _apub="$(_aws_pubkey)"
         if [[ -z "$_lpub" ]]; then
@@ -589,7 +693,41 @@ case "$_action" in
             fi
         fi
         ok "Using key: $KEY_FILE" ;;
+    rename)
+        ask KEY_PAIR_NAME "New key pair name (no file extension)" "$KEY_PAIR_NAME"
+        # An AWS key pair name must NOT include a file extension. Strip a trailing
+        # .pem/.pub if the user typed one, otherwise the default .pem path doubles
+        # to 'name.pem.pem' and the instance launches with the wrong pair name.
+        KEY_PAIR_NAME="${KEY_PAIR_NAME%.pem}"; KEY_PAIR_NAME="${KEY_PAIR_NAME%.pub}"
+        export KEY_PAIR_NAME
+        _default_pem="$HOME/.ssh/${KEY_PAIR_NAME}.pem"
+        ask KEY_FILE "Path to .pem file for '${KEY_PAIR_NAME}'" "$_default_pem"
+        KEY_FILE="${KEY_FILE/#\~/$HOME}"
+        KEY_FILE="${KEY_FILE//.pem.pem/.pem}"   # collapse an accidental double .pem
+        if [[ ! -f "$KEY_FILE" ]]; then
+            warn "File not found: $KEY_FILE — ensure it is accessible before Step 6."
+        else
+            _lpub="$(_local_pubkey)"; _apub="$(_aws_pubkey)"
+            if [[ -n "$_lpub" && "$_apub" == "$_lpub" ]]; then
+                ok "Key pair '$KEY_PAIR_NAME' exists in AWS and matches local .pem."
+            elif [[ "$_apub" == "__ABSENT__" ]]; then
+                info "AWS key pair '$KEY_PAIR_NAME' not found — importing local key ..."
+                _kp_import || die "import-key-pair failed."
+                ok "Local key imported to AWS as '$KEY_PAIR_NAME'."
+            elif [[ "$_apub" == __ERROR__:* || -z "$_apub" ]]; then
+                warn "Couldn't verify against AWS (${_apub#__ERROR__:}) — proceeding."
+            else
+                warn "Local .pem does NOT match AWS '$KEY_PAIR_NAME'."
+                if confirm "Replace the AWS pair with this local key?" Y; then
+                    _kp_delete || true; _kp_import || die "import-key-pair failed."
+                    ok "AWS '$KEY_PAIR_NAME' now matches your local key."
+                fi
+            fi
+        fi
+        ok "Key pair name: '$KEY_PAIR_NAME'   Key file: $KEY_FILE" ;;
 esac
+# Final safety net: never persist a doubled .pem extension.
+KEY_FILE="${KEY_FILE//.pem.pem/.pem}"
 st_set KEY_FILE "$KEY_FILE"
 
 # ── final safety check: the local key MUST match the AWS pair before Step 6 ────
@@ -638,7 +776,7 @@ if should_run STEP_6 "EC2 provisioned (IP: ${PUBLIC_IP:-none})"; then
         ask_host PUBLIC_IP "Existing EC2 Public IP" "${PUBLIC_IP:-}"
     fi
     st_set PUBLIC_IP "$PUBLIC_IP"
-    st_set STEP_6 done
+    st_set STEP_6 "done"
     ok "EC2 ready. Public IP: $PUBLIC_IP"
 fi
 
@@ -666,7 +804,7 @@ d['CLIENT_DOMAIN'] = os.environ['NEW_DOMAIN']
 open(p, 'w').write(json.dumps(d, indent=2))
 print("     Updated CLIENT_DOMAIN -> " + os.environ['NEW_DOMAIN'])
 PYEOF
-    st_set STEP_7 done
+    st_set STEP_7 "done"
     ok "CLIENT_DOMAIN = ${_new_domain}"
 fi
 
@@ -716,7 +854,7 @@ if should_run STEP_8 "bootstrap complete"; then
     done
     echo
     ok "Bootstrap complete."
-    st_set STEP_8 done
+    st_set STEP_8 "done"
 fi
 
 # ── Ensure cloudpiadmin has passwordless sudo ─────────────────────────────────
@@ -743,7 +881,7 @@ if should_run STEP_9 "secrets uploaded"; then
     with_spinner "Uploading secrets to AWS Secrets Manager (region ${REGION})" \
         python3 "$SCRIPT_DIR/setup_aws_secrets.py" upload --region "$REGION" --file "$SECRETS_JSON" \
         || die "Secrets upload failed — see output above."
-    st_set STEP_9 done
+    st_set STEP_9 "done"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -759,7 +897,7 @@ if should_run STEP_10A "install type chosen"; then
     echo "       3) Upload local cloudpi-files folder → EC2"
     ask _dt "Choice" "1"
     st_set DEPLOY_TYPE "${_dt:-1}"
-    st_set STEP_10A done
+    st_set STEP_10A "done"
 fi
 DEPLOY_TYPE="$(st_get DEPLOY_TYPE)"; DEPLOY_TYPE="${DEPLOY_TYPE:-1}"
 
@@ -774,9 +912,32 @@ REMOTE
 
     if [[ "$DEPLOY_TYPE" == "3" ]]; then
         info "=== Upload local cloudpi-files → EC2 /home/cloudpiadmin/cloudpi ==="
-        ask _local_src "Local source folder" "$SCRIPT_DIR/cloudpi-files"
-        _local_src="${_local_src/#\~/$HOME}"
-        [[ -d "$_local_src" ]] || die "Local folder not found: $_local_src"
+        # Re-prompt until we get a real app-bundle folder. Guards against the
+        # common mistake of pointing this at the deploy toolkit directory itself
+        # (which would rsync deploy_interactive.sh, the .py scripts, state files,
+        # etc. onto the instance instead of the CloudPi app files).
+        while true; do
+            ask _local_src "Local source folder (the cloudpi-files app bundle)" "$SCRIPT_DIR/cloudpi-files"
+            _local_src="${_local_src/#\~/$HOME}"
+            _local_src="${_local_src%/}"   # strip any trailing slash
+
+            if [[ ! -d "$_local_src" ]]; then
+                warn "Folder not found: $_local_src — try again."
+                continue
+            fi
+            # Refuse the deploy toolkit dir (identified by deploy_interactive.sh).
+            if [[ -e "$_local_src/deploy_interactive.sh" ]]; then
+                warn "That is the deploy toolkit folder, not the CloudPi app bundle."
+                warn "Point this at the 'cloudpi-files' folder (contains docker-compose.yml)."
+                continue
+            fi
+            # Sanity-check it looks like the app bundle.
+            if [[ ! -e "$_local_src/docker-compose.yml" ]]; then
+                warn "No docker-compose.yml in $_local_src — this may not be the app bundle."
+                confirm "Upload it anyway?" N || continue
+            fi
+            break
+        done
 
         info "Uploading $_local_src → cloudpiadmin@${PUBLIC_IP}:/home/cloudpiadmin/cloudpi/ ..."
         rsync -az \
@@ -818,22 +979,53 @@ REMOTE
         ok "Files migrated from existing server."
 
     else
-        info "=== Fresh install: verifying git clone ==="
+        info "=== Fresh install: git clone the app bundle ==="
         ssh_in bash -s <<'REMOTE'
 set -euo pipefail
-if [ -e /home/cloudpiadmin/cloudpi/docker-compose.yml ]; then
-    echo "     CloudPi files already present."
+DEST=/home/cloudpiadmin/cloudpi
+if [ -e "$DEST/docker-compose.yml" ]; then
+    echo "     CloudPi files already present — skipping clone."
 else
-    sudo -u cloudpiadmin git clone \
-        https://github.com/PurpleDataInc-TX/cloudpi-aws-deploy.git \
-        /home/cloudpiadmin/cloudpi/repo 2>/dev/null \
-      && sudo -u cloudpiadmin cp -rn /home/cloudpiadmin/cloudpi/repo/. /home/cloudpiadmin/cloudpi/ \
-      || echo "     (git clone skipped/failed — generated files in steps 10c/10d will be used.)"
+    TMP=$(sudo -u cloudpiadmin mktemp -d)
+    if sudo -u cloudpiadmin git clone --depth 1 \
+         https://github.com/PurpleDataInc-TX/AWS_EC2-Deploy.git "$TMP/repo" 2>/dev/null; then
+        # The APP BUNDLE lives in the repo's cloudpi-files/ subdir. Copy ONLY that
+        # (not the deploy toolkit at the repo root — deploy_interactive.sh, the
+        # .py scripts, Install from EC2/, etc.) so the app dir stays clean and the
+        # compose/.env land at the top level where the app expects them.
+        if [ -d "$TMP/repo/cloudpi-files" ]; then
+            sudo -u cloudpiadmin cp -rn "$TMP/repo/cloudpi-files/." "$DEST/"
+            echo "     Copied app bundle from repo cloudpi-files/."
+        elif [ -e "$TMP/repo/docker-compose.yml" ]; then
+            sudo -u cloudpiadmin cp -rn "$TMP/repo/." "$DEST/"
+            echo "     Copied app files from repo root."
+        else
+            echo "     WARNING: no docker-compose.yml in the repo — steps 10c/10d will generate one."
+        fi
+        sudo rm -rf "$TMP"
+    else
+        echo "     (git clone failed — generated files in steps 10c/10d will be used.)"
+    fi
 fi
 REMOTE
         ok "CloudPi directory ready."
     fi
-    st_set STEP_10B done
+
+    # ── Mandatory: cp_upgrade.sh must be on the server for future upgrades ─────
+    # Uploaded explicitly (not left to the install-type path) so it is ALWAYS
+    # present regardless of type 1/2/3.
+    _cpupg="$SCRIPT_DIR/cloudpi-files/cp_upgrade.sh"
+    if [[ -f "$_cpupg" ]]; then
+        scp_up "$_cpupg" "/tmp/cp_upgrade.sh"
+        ssh_run "sudo mv /tmp/cp_upgrade.sh /home/cloudpiadmin/cloudpi/cp_upgrade.sh && \
+                 sudo chown cloudpiadmin:cloudpiadmin /home/cloudpiadmin/cloudpi/cp_upgrade.sh && \
+                 sudo chmod 755 /home/cloudpiadmin/cloudpi/cp_upgrade.sh"
+        ok "cp_upgrade.sh installed at /home/cloudpiadmin/cloudpi/cp_upgrade.sh (executable)."
+    else
+        die "Required file not found: $_cpupg — cp_upgrade.sh is mandatory for upgrades."
+    fi
+
+    st_set STEP_10B "done"
 fi
 
 # ── 10c  docker-compose.yml ───────────────────────────────────────────────────
@@ -850,7 +1042,7 @@ if should_run STEP_10C "docker-compose.yml configured"; then
     if [[ "${_copt:-1}" == "3" ]]; then
         ok "docker-compose.yml step skipped."
     else
-        ask _ver "Target release version (e.g. v1.1.044)" "v1.1.044"
+        ask _ver "Target release version (e.g. v1.1.048)" "v1.1.048"
         [[ "$_ver" =~ ^v?[0-9]+(\.[0-9]+)*$ ]] || warn "Version '${_ver}' looks unusual — continuing anyway."
 
         if [[ "${_copt:-1}" == "2" ]]; then
@@ -942,32 +1134,161 @@ COMPOSE
             ok "docker-compose.yml generated (version: ${_ver})."
         fi
     fi
-    st_set STEP_10C done
+    st_set STEP_10C "done"
 fi
 
 # ── 10d  .env file ────────────────────────────────────────────────────────────
+# MERGE (not overwrite): if a .env was uploaded with the app bundle (deploy type
+# 3) it carries app config (CLIENT_*, WORKERS, DB_*, intervals, ...). We must
+# keep those and only set/fix the deploy-critical keys — HOST/SUBDOMAIN to this
+# instance, HTTPS on, and the cert paths to the .pem files step 10e actually
+# creates (bundle templates often ship .crt/.key paths that don't exist here).
 if should_run STEP_10D ".env file"; then
-    _env_tmp=$(mktemp /tmp/cloudpi.env.XXXXXX)
-    cat > "$_env_tmp" <<ENV
-HOST=${PUBLIC_IP}
-HTTPS=true
-SUBDOMAIN=${PUBLIC_IP}
-CERT_PATH=/home/certs/cert.pem
-KEY_PATH=/home/certs/privkey.pem
-CA_BUNDLE_PATH=/home/certs/ca_bundle.pem
-ENV
-    scp_up "$_env_tmp" "/tmp/cloudpi.env"
-    rm -f "$_env_tmp"
-    ssh_run "sudo mv /tmp/cloudpi.env /home/cloudpiadmin/cloudpi/.env && \
-             sudo chown cloudpiadmin:cloudpiadmin /home/cloudpiadmin/cloudpi/.env"
-    ok ".env file created."
-    st_set STEP_10D done
+    ssh_in "HOSTVAL='$PUBLIC_IP' bash -s" <<'REMOTE'
+set -euo pipefail
+ENV=/home/cloudpiadmin/cloudpi/.env
+sudo touch "$ENV"
+# set_kv KEY VALUE — replace an existing KEY= line, else append it.
+set_kv() {
+    local k="$1" v="$2"
+    if sudo grep -qE "^[[:space:]]*${k}=" "$ENV"; then
+        sudo sed -i "s#^[[:space:]]*${k}=.*#${k}=${v}#" "$ENV"
+    else
+        printf '%s=%s\n' "$k" "$v" | sudo tee -a "$ENV" >/dev/null
+    fi
+}
+set_kv HOST           "$HOSTVAL"
+set_kv HTTPS          true
+set_kv SUBDOMAIN      "$HOSTVAL"
+set_kv CERT_PATH      /home/certs/cert.pem
+set_kv KEY_PATH       /home/certs/privkey.pem
+set_kv CA_BUNDLE_PATH /home/certs/ca_bundle.pem
+sudo chown cloudpiadmin:cloudpiadmin "$ENV"
+echo ".env merged (deploy-critical keys set; existing app config preserved)."
+REMOTE
+    ok ".env configured (merged with uploaded bundle, if any)."
+    st_set STEP_10D "done"
 fi
 
-# ── 10e  TLS certificates (self-signed) ──────────────────────────────────────
+# ── 10e  TLS certificates (self-signed or Let's Encrypt) ─────────────────────
 if should_run STEP_10E "TLS certificates"; then
-    info "Generating self-signed certificate for CN=${PUBLIC_IP} ..."
-    ssh_in "PUBIP='$PUBLIC_IP' bash -s" <<'REMOTE'
+    echo "     TLS certificate options:"
+    echo "       1) Self-signed for the EC2 IP   (default; browser shows a warning)"
+    echo "       2) Let's Encrypt for a domain   (trusted cert; needs a domain pointing to ${PUBLIC_IP})"
+    ask _tlsopt "Choice" "1"
+
+    if [[ "${_tlsopt:-1}" == "2" ]]; then
+        # ── Let's Encrypt (trusted cert for a real domain) ────────────────────
+        ask_host _le_domain "Domain name (its A record must point to ${PUBLIC_IP})" ""
+        ask      _le_email  "Email for Let's Encrypt renewal notices"              ""
+        [[ -n "$_le_domain" && -n "$_le_email" ]] || die "Domain and email are required for Let's Encrypt."
+
+        # DNS sanity check (warn-only; requires the domain to resolve to this IP).
+        _resolved=$(dig +short "$_le_domain" A 2>/dev/null | tail -1 || true)
+        if [[ -n "$_resolved" && "$_resolved" != "$PUBLIC_IP" ]]; then
+            warn "DNS: ${_le_domain} resolves to ${_resolved}, not ${PUBLIC_IP}."
+            warn "Let's Encrypt HTTP validation will fail until the A record points to ${PUBLIC_IP}."
+            confirm "Continue anyway?" N || die "Point ${_le_domain} at ${PUBLIC_IP}, then re-run step 10e."
+        elif [[ -z "$_resolved" ]]; then
+            warn "Could not resolve ${_le_domain} locally — make sure its A record points to ${PUBLIC_IP}."
+        fi
+
+        info "Requesting Let's Encrypt certificate for ${_le_domain} (certbot --standalone, port 80) ..."
+        # certbot --standalone binds port 80 for the ACME HTTP-01 challenge. The
+        # app stack starts later (step 10h), so port 80 is free here, and the
+        # security group already allows 80 inbound.
+        if ssh_in "REGION='$REGION' DOMAIN='$_le_domain' EMAIL='$_le_email' bash -s" <<'REMOTE'
+set -euo pipefail
+CERTS=/home/cloudpiadmin/cloudpi/certs
+ENV=/home/cloudpiadmin/cloudpi/.env
+
+# Free port 80 for the standalone ACME challenge. On a fresh deploy nothing is
+# bound yet (the app starts in step 10h); on a re-run the app may hold :80, so
+# stop it first. An EXIT trap guarantees it comes back even if certbot fails
+# (otherwise 'set -e' would leave a running site down on a failed renewal).
+APP_WAS_UP=0
+restore_app() {
+    [ "$APP_WAS_UP" = "1" ] && { cd /home/cloudpiadmin/cloudpi && sudo docker compose up -d >/dev/null 2>&1 || true; }
+}
+trap restore_app EXIT
+if sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -qx cloudpi-app; then
+    APP_WAS_UP=1
+    sudo docker stop cloudpi-app >/dev/null 2>&1 || true
+fi
+
+sudo certbot certonly --standalone --non-interactive --agree-tos \
+    --preferred-challenges http -m "$EMAIL" -d "$DOMAIN" --keep-until-expiring
+
+LE=/etc/letsencrypt/live/"$DOMAIN"
+sudo mkdir -p "$CERTS"
+# The app entrypoint builds fullchain from CERT_PATH + CA_BUNDLE_PATH, so map:
+#   cert.pem      = leaf cert        (LE cert.pem)
+#   ca_bundle.pem = intermediate(s)  (LE chain.pem)
+#   privkey.pem   = private key      (LE privkey.pem)
+sudo cp "$LE/cert.pem"    "$CERTS/cert.pem"
+sudo cp "$LE/chain.pem"   "$CERTS/ca_bundle.pem"
+sudo cp "$LE/privkey.pem" "$CERTS/privkey.pem"
+sudo chown -R 1000:1000 "$CERTS"
+sudo chmod 644 "$CERTS/cert.pem" "$CERTS/ca_bundle.pem"
+sudo chmod 640 "$CERTS/privkey.pem"
+
+# Serve on the domain so the host matches the certificate CN/SAN.
+if [ -f "$ENV" ]; then
+    sudo sed -i "s#^HOST=.*#HOST=${DOMAIN}#"           "$ENV"
+    sudo sed -i "s#^SUBDOMAIN=.*#SUBDOMAIN=${DOMAIN}#" "$ENV"
+fi
+
+# Keep CLIENT_DOMAIN (used for app origin URLs) in Secrets Manager aligned.
+# Best-effort: the cert is already installed, so a Secrets Manager hiccup here
+# must not fail the whole TLS step (set -e would otherwise abort).
+if SM=$(/usr/local/bin/aws secretsmanager get-secret-value \
+        --region "$REGION" --secret-id cloudpi-secrets --query SecretString --output text 2>/dev/null) \
+   && NEW=$(printf '%s' "$SM" | DOMAIN="$DOMAIN" python3 -c \
+        "import json,sys,os; d=json.load(sys.stdin); d['CLIENT_DOMAIN']=os.environ['DOMAIN']; print(json.dumps(d))") \
+   && /usr/local/bin/aws secretsmanager put-secret-value \
+        --region "$REGION" --secret-id cloudpi-secrets --secret-string "$NEW" >/dev/null 2>&1; then
+    echo "CLIENT_DOMAIN updated to ${DOMAIN} in Secrets Manager."
+else
+    echo "WARN: could not update CLIENT_DOMAIN in Secrets Manager — set it manually if needed."
+fi
+
+# Auto-renewal: on each renewal, redeploy the cert into the app dir + restart.
+sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/cloudpi-cert.sh >/dev/null <<HOOKEOF
+#!/bin/bash
+set -euo pipefail
+LE=/etc/letsencrypt/live/${DOMAIN}
+CERTS=/home/cloudpiadmin/cloudpi/certs
+cp "\$LE/cert.pem"    "\$CERTS/cert.pem"
+cp "\$LE/chain.pem"   "\$CERTS/ca_bundle.pem"
+cp "\$LE/privkey.pem" "\$CERTS/privkey.pem"
+chown -R 1000:1000 "\$CERTS"
+cd /home/cloudpiadmin/cloudpi && docker compose restart app || true
+HOOKEOF
+sudo chmod 755 /etc/letsencrypt/renewal-hooks/deploy/cloudpi-cert.sh
+
+# The app (if it was stopped to free port 80) is restarted by the EXIT trap.
+echo "Let's Encrypt certificate installed for ${DOMAIN}; auto-renewal hook created."
+REMOTE
+        then
+            ok "Let's Encrypt certificate issued for ${_le_domain} (auto-renews via certbot timer)."
+            # Mirror CLIENT_DOMAIN into the local secrets file so a later re-run of step 9 stays consistent.
+            NEW_DOMAIN="$_le_domain" python3 - <<'PYEOF'
+import json, os
+p = os.environ['SCRIPT_DIR'] + '/cloudpi-secrets.json'
+d = json.load(open(p))
+d['CLIENT_DOMAIN'] = os.environ['NEW_DOMAIN']
+open(p, 'w').write(json.dumps(d, indent=2))
+print("     Local secrets CLIENT_DOMAIN -> " + os.environ['NEW_DOMAIN'])
+PYEOF
+        else
+            warn "Let's Encrypt issuance failed — check the domain's A record and that port 80 is reachable."
+            die "TLS setup incomplete. Fix DNS/port 80 and re-run step 10e, or choose self-signed."
+        fi
+    else
+        # ── Self-signed for the EC2 IP (default) ──────────────────────────────
+        info "Generating self-signed certificate for CN=${PUBLIC_IP} ..."
+        ssh_in "PUBIP='$PUBLIC_IP' bash -s" <<'REMOTE'
 set -euo pipefail
 sudo mkdir -p /home/cloudpiadmin/cloudpi/certs
 sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
@@ -981,8 +1302,9 @@ sudo chmod 644 /home/cloudpiadmin/cloudpi/certs/cert.pem
 sudo chmod 640 /home/cloudpiadmin/cloudpi/certs/privkey.pem
 sudo chmod 644 /home/cloudpiadmin/cloudpi/certs/ca_bundle.pem
 REMOTE
-    ok "TLS certificates created."
-    st_set STEP_10E done
+        ok "Self-signed TLS certificate created."
+    fi
+    st_set STEP_10E "done"
 fi
 
 # ── 10f  Secrets fetch script ─────────────────────────────────────────────────
@@ -1029,7 +1351,7 @@ FETCHSCRIPT
     ssh_run "sudo mv /tmp/cloudpi-fetch-secrets.sh /usr/local/bin/cloudpi-fetch-secrets.sh && \
              sudo chmod 755 /usr/local/bin/cloudpi-fetch-secrets.sh"
     ok "Secrets fetch script installed (region: ${REGION})."
-    st_set STEP_10F done
+    st_set STEP_10F "done"
 fi
 
 # ── 10g  Docker Hub login ─────────────────────────────────────────────────────
@@ -1056,7 +1378,7 @@ sudo chown -R cloudpiadmin:cloudpiadmin /home/cloudpiadmin/.docker
 sudo chmod 600 /home/cloudpiadmin/.docker/config.json
 REMOTE
     ok "Docker Hub login complete."
-    st_set STEP_10G done
+    st_set STEP_10G "done"
 fi
 
 # ── 10h  setup_docker_compose_service.py ─────────────────────────────────────
@@ -1078,6 +1400,16 @@ if should_run STEP_10H "systemd services installed"; then
         warn "Retry manually on EC2: sudo systemctl start cloudpi-fetch-secrets"
     fi
 
+    # The app (Flask, UID 1000 in-container) writes its JSON log to
+    # /var/log/pico, bind-mounted from the host. The dir MUST exist and be
+    # writable by UID 1000 BEFORE the container starts, or Flask crash-loops
+    # with 'PermissionError: /var/log/pico/app.log'. 'syslog' group lets the
+    # host rsyslog tail it; fall back to UID 1000 if that group is absent.
+    info "Pre-creating /var/log/pico (host log dir for the app) ..."
+    ensure_log_dir \
+        && ok "/var/log/pico ready (owner UID 1000)." \
+        || warn "Could not set up /var/log/pico — the app may fail to write logs."
+
     info "Starting cloudpi-docker-compose ..."
     if ssh_run "sudo systemctl start cloudpi-docker-compose" 2>/dev/null; then
         ok "cloudpi-docker-compose started."
@@ -1086,7 +1418,21 @@ if should_run STEP_10H "systemd services installed"; then
         ssh_run "sudo journalctl -u cloudpi-docker-compose --no-pager -n 20" 2>/dev/null || true
     fi
 
-    st_set STEP_10H done
+    st_set STEP_10H "done"
+fi
+
+# ── 10i  Reconcile DB password with secrets (baked-in datadir fix) ────────────
+# See reconcile_db_password() near the top for the full explanation. Guarded by
+# an auth probe inside the function, so it only resets when actually needed.
+if should_run STEP_10I "DB password reconciled with secrets"; then
+    info "Checking whether the app can authenticate to MySQL ..."
+    if reconcile_db_password; then
+        ok "DB password reconciled with secrets."
+        st_set STEP_10I "done"
+    else
+        warn "Could not reconcile the DB password automatically."
+        warn "Re-run this step, or reset manually with a --skip-grant-tables container."
+    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1094,50 +1440,69 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 header 11 "First Boot & Verification"
 
-# ── 11a  Wait for containers ──────────────────────────────────────────────────
+# ── 11a  Wait for containers (with automatic self-repair) ─────────────────────
+# Pass only when BOTH containers are in docker's 'healthy' set. If they don't
+# become healthy in time, inspect the app log and AUTO-APPLY the matching fix
+# (log-dir perms / DB-password reconcile / secrets re-fetch), then wait again —
+# up to _MAX_REPAIRS rounds — so first-boot problems self-heal without a manual
+# re-run of steps 10h/10i.
 if should_run STEP_11A "containers healthy"; then
-    info "Waiting for BOTH cloudpi-db and cloudpi-app to report 'healthy' — up to 10 min ..."
-    _n=0; _max=60; _timed_out=0
-    # Pass only when BOTH containers are in docker's 'healthy' set (the app's
-    # healthcheck has a ~120s start_period, so this also waits out app warmup).
-    until ssh_run 'h=$(sudo docker ps --filter health=healthy --format "{{.Names}}" 2>/dev/null); echo "$h" | grep -qx cloudpi-db && echo "$h" | grep -qx cloudpi-app' 2>/dev/null; do
-        if (( ++_n >= _max )); then
-            _timed_out=1
+    _MAX_REPAIRS=3; _repair=0; _ok=0
+
+    # _wait_healthy — poll up to ~100s; returns 0 if both healthy, 1 on timeout.
+    _wait_healthy() {
+        local n=0 max=10
+        until ssh_run 'h=$(sudo docker ps --filter health=healthy --format "{{.Names}}" 2>/dev/null); echo "$h" | grep -qx cloudpi-db && echo "$h" | grep -qx cloudpi-app' 2>/dev/null; do
+            if (( ++n >= max )); then echo; return 1; fi
+            printf "\r     Attempt %d/%d — waiting for containers ..." "$n" "$max"
+            sleep 10
+        done
+        echo; return 0
+    }
+
+    while true; do
+        info "Waiting for BOTH cloudpi-db and cloudpi-app to report 'healthy' — up to ~100s ..."
+        if _wait_healthy; then _ok=1; break; fi
+
+        if (( _repair >= _MAX_REPAIRS )); then
+            warn "Auto-repair exhausted after ${_MAX_REPAIRS} round(s)."
             break
         fi
+        (( ++_repair ))
 
-        # Every 3 attempts (~30s) print a diagnostic snapshot (single SSH connection)
-        if (( _n % 3 == 0 )); then
-            echo
-            info "--- Diagnostics (attempt ${_n}/${_max}) ---"
-            ssh_in bash -s <<'DIAG'
-echo "==> Secrets in tmpfs:"
-ls /run/secrets-tmp/ 2>/dev/null || echo "     (empty — fetch-secrets has not run)"
-echo "==> Fetch-secrets service:"
-sudo systemctl is-active cloudpi-fetch-secrets 2>/dev/null || echo "     inactive/failed"
-echo "==> Container status:"
-sudo docker ps -a --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null || echo "     (none)"
-echo "==> Container health:"
-sudo docker ps --format '{{.Names}}: {{.Status}}' 2>/dev/null | grep cloudpi- || echo "     (none up)"
-echo "==> Last 5 lines of cloudpi-app log:"
-sudo docker logs cloudpi-app --tail 5 2>/dev/null || echo "     (not running)"
-DIAG
+        # Gather signals: recent app log + fetch-secrets service state.
+        _applog=$(ssh_run "sudo docker logs cloudpi-app --tail 40 2>&1" 2>/dev/null || true)
+        _fetch=$(ssh_run "systemctl is-active cloudpi-fetch-secrets 2>/dev/null || echo inactive" 2>/dev/null || true)
+
+        warn "Containers not healthy — auto-repair round ${_repair}/${_MAX_REPAIRS} ..."
+        if echo "$_applog" | grep -q "PermissionError.*/var/log/pico"; then
+            info "  → /var/log/pico permission error detected — fixing log dir + restarting app."
+            ensure_log_dir && ok "  log dir fixed." || warn "  log dir fix failed."
+            ssh_run "cd /home/cloudpiadmin/cloudpi && sudo docker compose restart app" 2>/dev/null || true
+        elif echo "$_applog" | grep -qiE "access denied|mysql connection failed"; then
+            info "  → DB auth failure detected — reconciling DB password with secrets."
+            reconcile_db_password && ok "  DB password reconciled." || warn "  DB reconcile failed."
+        elif [[ "$_fetch" != "active" ]]; then
+            info "  → cloudpi-fetch-secrets not active — re-fetching secrets + re-applying stack."
+            restart_fetch_secrets && ok "  secrets re-fetched." || warn "  fetch-secrets restart failed."
         else
-            printf "\r     Attempt %d/%d ..." "$_n" "$_max"
+            info "  → No known failure signature; giving the stack more time and retrying."
+            sleep 10
         fi
-        sleep 10
     done
-    echo
 
-    if (( _timed_out )); then
-        warn "Timed out — both containers never became healthy. Final state:"
-        ssh_run "sudo docker ps -a" || true
-        warn "Check 'sudo docker logs cloudpi-app' (Flask boot/migrations) and 'cloudpi-db'."
-        warn "Common cause: cloudpi-fetch-secrets failed → re-run step 10h to reinstall the systemd unit."
-    else
+    if (( _ok )); then
         ssh_run "sudo docker ps" || true
         ok "Containers healthy."
-        st_set STEP_11A done
+        st_set STEP_11A "done"
+    else
+        warn "Timed out — both containers never became healthy. Final state:"
+        ssh_run "sudo docker ps -a" || true
+        warn "Auto-repair could not resolve it. Inspect 'sudo docker logs cloudpi-app'."
+        warn "Manual fallbacks:"
+        warn "  • cloudpi-fetch-secrets failed → re-run step 10h to reinstall the systemd unit."
+        warn "  • 'Access denied'/'Waiting for MySQL' → re-run step 10i (DB password reconcile)."
+        warn "  • 'PermissionError: /var/log/pico/app.log' → re-run step 10h (creates /var/log/pico)."
     fi
 fi
 
@@ -1187,7 +1552,7 @@ echo "     App DB user '${APP_USER}' ensured with required privileges."
 REMOTE
     then
         ok "MySQL app user configured."
-        st_set STEP_11B done
+        st_set STEP_11B "done"
     else
         warn "MySQL user setup failed — no working admin login, or the DB isn't ready."
         info "  sudo docker exec -it cloudpi-db mysql -u masteradmin -p   # verify admin login"
@@ -1216,7 +1581,7 @@ if should_run STEP_11C "API login verified"; then
     echo
     if [[ "$_http" == "200" ]]; then
         ok "Login successful (HTTP 200)."
-        st_set STEP_11C done
+        st_set STEP_11C "done"
     else
         warn "Login still returns HTTP $_http after warmup window — check: sudo docker logs cloudpi-app"
         info "Retry: curl -sk -X POST https://${PUBLIC_IP}/CPiN/v1/user/login -H 'Content-Type: application/json' -d '{\"email\":\"admin@cloudpi.ai\",\"password\":\"admin123\"}'"

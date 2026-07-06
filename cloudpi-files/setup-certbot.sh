@@ -217,10 +217,10 @@ check_port_80() {
     fi
     echo ""
 
-    read -p "Have you confirmed port 80 is open in your Azure NSG? (y/n): " PORT_CONFIRMED
+    read -p "Have you confirmed port 80 is open in your AWS Security Group? (y/n): " PORT_CONFIRMED
     if [[ ! "$PORT_CONFIRMED" =~ ^[Yy]$ ]]; then
-        print_error "Please open port 80 in your Azure Network Security Group before continuing"
-        print_info "You can do this in the Azure Portal under: VM -> Networking -> Add inbound port rule"
+        print_error "Please open port 80 in your AWS Security Group before continuing"
+        print_info "You can do this in the AWS Console under: EC2 -> Security Groups -> Edit inbound rules"
         exit 1
     fi
 }

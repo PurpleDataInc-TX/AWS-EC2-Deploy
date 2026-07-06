@@ -42,6 +42,16 @@ POLICY_NAME          = os.getenv("POLICY_NAME",          "CloudPiSecretsPolicy")
 SG_NAME              = os.getenv("SG_NAME",              "cloudpi-sg")
 AMI_ID               = os.getenv("AMI_ID",               "")           # auto-resolved if blank
 
+# "Automation & Recommendations" checkbox in deploy_interactive.sh. When on, the
+# instance role also gets the write/remediation actions from
+# terraform/automation/cloudpi-aws-automation.tf (start/stop/modify/terminate
+# EC2 & RDS, autoscaling update). Enabled when TF_SCRIPT selects the automation
+# variant, or AUTOMATION is truthy.
+AUTOMATION = (
+    os.getenv("TF_SCRIPT", "").strip() == "cloudpi-aws-automation.tf"
+    or os.getenv("AUTOMATION", "").strip().lower() in ("1", "true", "yes", "on")
+)
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def info(msg):    print(f"[INFO]  {msg}")
@@ -111,9 +121,7 @@ def ensure_iam_role(iam, sts) -> str:
     # Equivalent to:
     #   Azure "Key Vault Secrets User"    → GetSecretValue
     #   Azure "Key Vault Secrets Officer" → CreateSecret + PutSecretValue + UpdateSecret
-    secrets_policy = json.dumps({
-        "Version": "2012-10-17",
-        "Statement": [
+    policy_statements = [
             {
                 "Sid": "ReadSecrets",
                 "Effect": "Allow",
@@ -164,6 +172,7 @@ def ensure_iam_role(iam, sts) -> str:
                 "Sid": "InventoryRead",
                 "Effect": "Allow",
                 "Action": [
+                    "ec2:DescribeKeyPairs",
                     "ec2:Describe*",
                     "rds:Describe*",
                     "elasticache:Describe*",
@@ -187,7 +196,37 @@ def ensure_iam_role(iam, sts) -> str:
                 ],
                 "Resource": "*",
             },
-        ],
+    ]
+
+    # "Automation & Recommendations" checkbox → add the write/remediation
+    # statement from terraform/automation/cloudpi-aws-automation.tf. Kept in sync
+    # with that file's AutomationRemediation Sid.
+    if AUTOMATION:
+        info("Automation & Recommendations enabled — adding remediation (write) permissions.")
+        policy_statements.append({
+            "Sid": "AutomationRemediation",
+            "Effect": "Allow",
+            "Action": [
+                "ec2:StartInstances",
+                "ec2:StopInstances",
+                "ec2:ModifyInstanceAttribute",
+                "ec2:TerminateInstances",
+                "ec2:DeleteVolume",
+                "ec2:DeleteSnapshot",
+                "ec2:ReleaseAddress",
+                "ec2:CreateTags",
+                "ec2:DeleteTags",
+                "rds:StartDBInstance",
+                "rds:StopDBInstance",
+                "rds:ModifyDBInstance",
+                "autoscaling:UpdateAutoScalingGroup",
+            ],
+            "Resource": "*",
+        })
+
+    secrets_policy = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": policy_statements,
     })
 
     iam.put_role_policy(
@@ -195,7 +234,8 @@ def ensure_iam_role(iam, sts) -> str:
         PolicyName=POLICY_NAME,
         PolicyDocument=secrets_policy,
     )
-    ok(f"IAM inline policy '{POLICY_NAME}' attached.")
+    _variant = "read-only + automation/remediation" if AUTOMATION else "read-only"
+    ok(f"IAM inline policy '{POLICY_NAME}' attached ({_variant}).")
 
     info(f"Ensuring instance profile '{INSTANCE_PROFILE}'...")
     try:
@@ -342,9 +382,12 @@ def build_user_data() -> str:
           ln -s /data/cloudpi /home/cloudpiadmin/cloudpi
         fi
 
-        # Clone CloudPi deployment repo
-        sudo -u cloudpiadmin git clone https://github.com/PurpleDataInc-TX/cloudpi-aws-deploy.git \\
-          /home/cloudpiadmin/cloudpi || true
+        # NOTE: application files are NOT cloned here. deploy_interactive.sh step
+        # 10b populates /home/cloudpiadmin/cloudpi (git clone for a fresh install,
+        # rsync for a local bundle, or migration). Cloning here as well produced a
+        # UNION of the GitHub repo and the uploaded bundle on the instance
+        # (duplicate/mismatched .env, Azure keyvault scripts, stray .py/.sh), so
+        # the clone was removed to keep the app dir deterministic.
 
         # Enable SSH for cloudpiadmin using the same EC2 key pair
         mkdir -p /home/cloudpiadmin/.ssh
@@ -364,7 +407,104 @@ def build_user_data() -> str:
 
 
 # ─── 5. Launch EC2 Instance ────────────────────────────────────────────────────
-def launch_instance(ec2, ami_id: str, sg_id: str, profile_name: str) -> str:
+def prompt_key_pair() -> str:
+    """Return the key pair name to use, prompting the user if KEY_PAIR_NAME was not set via env."""
+    env_override = os.getenv("KEY_PAIR_NAME")
+    if env_override:
+        info(f"Using key pair from KEY_PAIR_NAME env var: {env_override}")
+        return env_override
+
+    print(f"""
+  Key pair options:
+    1) Use existing key pair: {KEY_PAIR_NAME}  (default)
+    2) Enter a custom key pair name
+    3) No key pair (skip SSH key attachment)
+""")
+    while True:
+        print("  Choice [1]: ", end="", flush=True)
+        choice = input().strip() or "1"
+        if choice == "1":
+            return KEY_PAIR_NAME
+        elif choice == "2":
+            print("  Custom key pair name: ", end="", flush=True)
+            name = input().strip()
+            if name:
+                return name
+            warn("No name entered — falling back to default.")
+            return KEY_PAIR_NAME
+        elif choice == "3":
+            return "none"
+        else:
+            warn("Invalid choice — please enter 1, 2, or 3.")
+
+
+def ensure_key_pair(ec2, key_pair_name: str) -> str:
+    """Verify the key pair exists in AWS; offer to import or create it if not."""
+    if key_pair_name.lower() == "none":
+        return key_pair_name
+
+    try:
+        ec2.describe_key_pairs(KeyNames=[key_pair_name])
+        ok(f"Key pair '{key_pair_name}' found in AWS.")
+        return key_pair_name
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code == "UnauthorizedOperation":
+            warn(f"Cannot verify key pair — IAM user lacks ec2:DescribeKeyPairs. Proceeding.")
+            warn("Add ec2:DescribeKeyPairs to the IAM user/role policy to enable this check.")
+            return key_pair_name
+        if code != "InvalidKeyPair.NotFound":
+            raise
+
+    warn(f"Key pair '{key_pair_name}' does not exist in AWS ({REGION}).")
+    print(f"""
+  Options:
+    1) Import existing .pem file  (keeps your current private key)
+    2) Create a new key pair in AWS  (saves new .pem to ~/.ssh/)
+    3) Abort
+""")
+    while True:
+        print("  Choice [1]: ", end="", flush=True)
+        choice = input().strip() or "1"
+
+        if choice == "1":
+            default_pem = os.path.expanduser(f"~/.ssh/{key_pair_name}.pem")
+            print(f"  Path to .pem file [{default_pem}]: ", end="", flush=True)
+            pem_path = input().strip() or default_pem
+            pem_path = os.path.expanduser(pem_path)
+            if not os.path.exists(pem_path):
+                warn(f"File not found: {pem_path}")
+                continue
+            import subprocess
+            result = subprocess.run(
+                ["ssh-keygen", "-y", "-f", pem_path],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                warn(f"Could not extract public key: {result.stderr.strip()}")
+                continue
+            pub_key = result.stdout.strip().encode()
+            ec2.import_key_pair(KeyName=key_pair_name, PublicKeyMaterial=pub_key)
+            ok(f"Key pair '{key_pair_name}' imported into AWS from {pem_path}.")
+            return key_pair_name
+
+        elif choice == "2":
+            resp = ec2.create_key_pair(KeyName=key_pair_name)
+            out_path = os.path.expanduser(f"~/.ssh/{key_pair_name}.pem")
+            with open(out_path, "w") as f:
+                f.write(resp["KeyMaterial"])
+            os.chmod(out_path, 0o400)
+            ok(f"New key pair created. Private key saved to {out_path}")
+            return key_pair_name
+
+        elif choice == "3":
+            die("Aborted by user.")
+
+        else:
+            warn("Invalid choice — please enter 1, 2, or 3.")
+
+
+def launch_instance(ec2, ami_id: str, sg_id: str, profile_name: str, key_pair_name: str) -> str:
     info(f"Launching EC2 instance ({INSTANCE_TYPE}, AMI: {ami_id})...")
 
     launch_kwargs = {
@@ -398,8 +538,8 @@ def launch_instance(ec2, ami_id: str, sg_id: str, profile_name: str) -> str:
         }],
     }
 
-    if KEY_PAIR_NAME.lower() != "none":
-        launch_kwargs["KeyName"] = KEY_PAIR_NAME
+    if key_pair_name.lower() != "none":
+        launch_kwargs["KeyName"] = key_pair_name
 
     resp = ec2.run_instances(**launch_kwargs)
     instance_id = resp["Instances"][0]["InstanceId"]
@@ -443,10 +583,12 @@ def main():
     clients = get_clients()
     ec2, iam, sts = clients["ec2"], clients["iam"], clients["sts"]
 
+    key_pair    = prompt_key_pair()
     ami_id      = resolve_ami(ec2)
     profile     = ensure_iam_role(iam, sts)
     sg_id       = ensure_security_group(ec2)
-    instance_id = launch_instance(ec2, ami_id, sg_id, profile)
+    key_pair    = ensure_key_pair(ec2, key_pair)
+    instance_id = launch_instance(ec2, ami_id, sg_id, profile, key_pair)
     public_ip   = allocate_and_associate_eip(ec2, instance_id)
 
     separator = "═" * 59
@@ -465,7 +607,7 @@ def main():
   Security Group : {sg_id}
 
   Next steps:
-  1. SSH:      ssh -i ~/.ssh/{KEY_PAIR_NAME}.pem cloudpiadmin@{public_ip}
+  1. SSH:      ssh -i ~/.ssh/{key_pair}.pem cloudpiadmin@{public_ip}
   2. Secrets:  python setup_aws_secrets.py upload
   3. Services: python setup_docker_compose_service.py
   4. TLS cert: sudo certbot certonly --standalone -d your.domain.com

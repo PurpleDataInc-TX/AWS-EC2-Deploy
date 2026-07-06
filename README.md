@@ -17,14 +17,36 @@ Complete procedure to bring up a new CloudPi environment on AWS EC2 from scratch
 
 ## Part 1 — AWS Account Setup (one-time per account)
 
-### 1.1 Create an IAM User for deployments
+### 1.1 Create an EC2 Key Pair
+
+The deployment connects to the instance over SSH, so create the key pair first and keep the private key safe.
+
+1. Sign in to AWS Console → **EC2** → **Network & Security** → **Key Pairs** → **Create key pair**
+2. Name: `cloudpi-key` (or any name — you reference it during deployment, script step 5)
+3. Key pair type: **RSA**
+4. Private key file format: **.pem**
+5. Click **Create key pair** — your browser downloads `cloudpi-key.pem`
+
+Move the downloaded key into your SSH folder and restrict its permissions (SSH refuses private keys that are readable by others):
+
+```bash
+mkdir -p ~/.ssh
+mv ~/Downloads/cloudpi-key.pem ~/.ssh/
+chmod 400 ~/.ssh/cloudpi-key.pem
+```
+
+> **Region must match.** Create the key pair in the same region you deploy into (default `us-east-1`). A key pair only exists in the region it was created in — if the regions differ, provisioning fails with `InvalidKeyPair.NotFound`.
+
+> During deployment, script step 5 detects `~/.ssh/cloudpi-key.pem` automatically. You can also point it at a different `.pem`, import an existing key, or create a new pair from there.
+
+### 1.2 Create an IAM User for deployments
 
 1. Sign in to AWS Console → IAM → Users → **Create user**
 2. Username: `cloudpiadmin` (or any name)
 3. Attach policy: **AdministratorAccess** (or at minimum: EC2FullAccess + IAMFullAccess + SecretsManagerFullAccess)
 4. Click through to **Create user**
 
-### 1.2 Create an Access Key
+### 1.3 Create an Access Key
 
 1. IAM → Users → click your user → **Security credentials** tab
 2. Under **Access keys** → **Create access key**
@@ -33,13 +55,13 @@ Complete procedure to bring up a new CloudPi environment on AWS EC2 from scratch
    - **Access Key ID** (e.g. `AKIAXXXXXXXXXXXXXXXXX`)
    - **Secret Access Key** (shown once only)
 
-### 1.3 Install Python dependencies locally
+### 1.4 Install Python dependencies locally
 
 ```bash
 pip3 install boto3 cryptography
 ```
 
-### 1.4 Configure AWS credentials in your shell session
+### 1.5 Configure AWS credentials in your shell session
 
 ```bash
 export AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXXX
@@ -59,9 +81,9 @@ python3 -c "import boto3; print(boto3.client('sts').get_caller_identity())"
 > **⚠ STOP — Request Required Files Before Continuing**
 > Before proceeding, contact your CloudPi support person to securely obtain the required **secrets and env sample files** and the **Docker Hub Personal Access Token (`docker-pat.txt`)** to proceed with the installation. These files are **not included in this repository** and contain credentials and settings that must be customized for your organisation. Do not proceed with the deployment until you have received and reviewed all three files.
 
-### 2.1 Edit cloudpi-secrets.json (check the file in the folder with filled in info as a reference)
+### 2.1 Edit cloudpi-secrets.json
 
-Copy and fill in `cloudpi-secrets.json` with your values:
+Fill in the **root** `cloudpi-secrets.json` (in the repository root, next to `deploy_interactive.sh`) with your values. This is the single source of truth — the deployment reads and uploads this file to AWS Secrets Manager (script steps 4, 7, and 9). Do **not** keep a separate copy inside `cloudpi-files/`; secrets are delivered to the instance only through Secrets Manager, never as a file in the app bundle.
 
 ```json
 {
@@ -123,29 +145,30 @@ python3 -c "import uuid; print(uuid.uuid4())"
 cd /path/to/cloudpi-deploy-aws-py
 bash deploy_interactive.sh
 ```
-./dep 
+
 The script walks through these steps in order:
 
 | Step | What it does |
 |------|-------------|
 | 1 | Checks local prerequisites (`python3`, `ssh`, `openssl`, `curl`) |
-| 2 | Prompts for AWS credentials if not set in the environment |
+| 2 | Prompts for AWS credentials if not set; asks the **Automation & Recommendations** question. Enabling it grants the instance role extra write/remediation permissions (see [Automation & Recommendations](#automation--recommendations)) |
 | 3 | Installs `boto3` + `cryptography` locally |
 | 4 | Creates or regenerates `cloudpi-secrets.json` (preserves `CLIENT_*` values) |
-| 5 | Creates or locates the SSH key pair (`~/.ssh/cloudpi-key.pem`) |
-| 6 | Provisions EC2 (IAM role, security group, t3.large, 30 GB gp3); AWS allocates and associates an Elastic IP — permanent, persists through reboots and stop/start — or accepts an existing IP |
+| 5 | SSH key pair: uses the default `~/.ssh/cloudpi-key.pem`, a custom name/path, or `none`. Verifies the key exists in AWS and matches your local `.pem` — offering to **import** your `.pem` or **create** a new pair if it's missing |
+| 6 | Provisions EC2 (IAM role, security group, t3.large, 30 GB gp3); AWS allocates and associates an Elastic IP — permanent, persists through reboots and stop/start — or accepts an existing IP. Applies the read-only **or** automation IAM policy per the step-2 choice |
 | 7 | Updates `CLIENT_DOMAIN` in secrets to the real EC2 IP |
 | 8 | Waits for EC2 user-data bootstrap to complete (polls via SSH as `cloudpiadmin`) |
 | 9 | Uploads all secrets to AWS Secrets Manager |
-| 10a | Asks: (1) fresh install — git clone from GitHub, (2) migration — rsync from Azure, (3) upload local `cloudpi-files` folder to EC2 |
-| 10b | Clones repo, rsyncs from Azure, or rsyncs from local `cloudpi-files/` → `/home/cloudpiadmin/cloudpi/`; sets `cloudpiadmin` ownership |
+| 10a | Asks: (1) fresh install — git clone from GitHub, (2) migration — rsync from an existing server, (3) upload local `cloudpi-files` folder to EC2 |
+| 10b | Clones repo, rsyncs from an existing server, or rsyncs from local `cloudpi-files/` → `/home/cloudpiadmin/cloudpi/`; sets `cloudpiadmin` ownership |
 | 10c | Options: (1) generate full `docker-compose.yml` from template, (2) update image tags only in existing file (replaces `latest` or any tag with the chosen version), (3) skip |
 | 10d | Generates `.env` with `HOST`, `HTTPS`, `SUBDOMAIN`, cert paths and uploads it |
-| 10e | Generates self-signed TLS certificates; sets correct ownership for the container |
+| 10e | TLS certificate — choose **(1) self-signed** for the EC2 IP (default) or **(2) Let's Encrypt** for a domain (trusted cert via `certbot --standalone`; also sets `HOST`/`SUBDOMAIN`/`CLIENT_DOMAIN` to the domain and installs an auto-renewal deploy hook) |
 | 10f | Installs `/usr/local/bin/cloudpi-fetch-secrets.sh` |
 | 10g | Logs in to Docker Hub (`cloudpi1`) and copies credentials to `cloudpiadmin` |
-| 10h | Uploads and runs `setup_docker_compose_service.py` (installs systemd units) |
-| 11a | Waits for `cloudpi-db` (healthy) and `cloudpi-app` to be up |
+| 10h | Installs the systemd units (`setup_docker_compose_service.py`), pre-creates `/var/log/pico` (writable by the container's UID 1000), then starts `cloudpi-fetch-secrets` and `cloudpi-docker-compose` |
+| 10i | **Reconciles the DB password with the secrets.** The prebuilt `cloudpi-db` image ships a pre-initialized datadir whose `masteradmin` password does not match Secrets Manager; this step probes the app's login and, only if it fails, resets the password via a throwaway `--skip-grant-tables` container. Idempotent (see [DB password / baked-in datadir](#db-password--baked-in-datadir)) |
+| 11a | Waits for `cloudpi-db` and `cloudpi-app` to report **healthy**. **Self-healing:** on timeout it inspects the app log and auto-applies the matching fix (log-dir permissions, DB-password reconcile, or secrets re-fetch), then retries — up to 3 repair rounds |
 | 11b | Creates/verifies the MySQL `masteradmin` user with required grants |
 | 11c | Tests the login endpoint (`/CPiN/v1/user/login`) |
 | 12 | Optional: reset admin password, update `CLIENT_DOMAIN` in DB |
@@ -161,6 +184,21 @@ ssh -i ~/.ssh/cloudpi-key.pem cloudpiadmin@<PUBLIC_IP>
 # Wrong — do not use
 ssh -i ~/.ssh/cloudpi-key.pem ubuntu@<PUBLIC_IP>
 ```
+
+### Automation & Recommendations
+
+Step 2 asks whether to enable **Automation & Recommendations** (matches the third checkbox in the CloudPi console onboarding). Your choice controls the IAM permissions attached to the EC2 instance role in step 6:
+
+| Choice | IAM policy | Permissions |
+|--------|-----------|-------------|
+| **No** (default) | read-only | billing / inventory / CUR-S3 read + Secrets Manager access |
+| **Yes** | read-only **+** automation | the above **plus** write/remediation actions |
+
+When enabled, the instance role also gets the `AutomationRemediation` statement (mirrored from `terraform/automation/cloudpi-aws-automation.tf`): start/stop/modify/terminate EC2 & RDS instances, delete volumes/snapshots, release addresses, manage tags, and update Auto Scaling groups.
+
+The choice is threaded through as the `TF_SCRIPT` environment variable; `deploy_aws_ec2.py` reads it (or `AUTOMATION=1`) and appends the write statement. Re-running step 6 with a different choice cleanly adds or removes the automation permissions — the inline policy is overwritten each run, so no stale grants are left behind.
+
+> ⚠ **The automation policy includes destructive actions** (`ec2:TerminateInstances`, `ec2:DeleteVolume`, `ec2:DeleteSnapshot`). Only enable it if CloudPi's remediation features require them, and confirm the action list against your organisation's policy first.
 
 ---
 
@@ -236,13 +274,15 @@ CA_BUNDLE_PATH=/home/certs/ca_bundle.pem
 ### docker-compose.yml (script step 10c)
 
 See **Appendix A** for the full file. Key points:
-- The script prompts for the target release version (e.g. `v1.1.044`) and sets both image tags
+- The script prompts for the target release version (e.g. `v1.1.048`) and sets both image tags
 - Secrets are read from `/run/secrets-tmp/` (tmpfs, populated by the fetch script on boot)
 - The app reads `.env` via `env_file`
 
 ### TLS certificates (script step 10e)
 
-Self-signed certificate for the EC2 IP, valid 365 days:
+Step 10e offers two certificate options:
+
+**Option 1 — Self-signed (default).** For IP-based access. Valid 365 days; browsers show an "untrusted" warning. Equivalent to:
 
 ```bash
 sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
@@ -256,6 +296,25 @@ sudo chmod 644 /home/cloudpiadmin/cloudpi/certs/cert.pem
 sudo chmod 640 /home/cloudpiadmin/cloudpi/certs/privkey.pem
 sudo chmod 644 /home/cloudpiadmin/cloudpi/certs/ca_bundle.pem
 ```
+
+**Option 2 — Let's Encrypt (trusted cert for a domain).** Requires a domain whose **A record points to the EC2 Elastic IP**. The step prompts for the domain + a renewal-notice email, then:
+
+1. Runs `certbot certonly --standalone -d <domain>` (uses port 80 for the ACME HTTP-01 challenge — free at this point since the app starts in step 10h; the security group already allows 80).
+2. Installs the issued cert into `certs/` with the app's expected mapping: `cert.pem` = leaf, `ca_bundle.pem` = LE `chain.pem`, `privkey.pem` = LE `privkey.pem`.
+3. Sets `HOST`/`SUBDOMAIN` in `.env` and `CLIENT_DOMAIN` in Secrets Manager (and the local secrets file) to the domain, so the app serves on the name the cert was issued for.
+4. Installs a certbot **deploy hook** (`/etc/letsencrypt/renewal-hooks/deploy/cloudpi-cert.sh`) that re-copies the renewed cert into `certs/` and restarts the app — so the 90-day auto-renewal is fully handled.
+
+```bash
+# Manual equivalent (what step 10e automates)
+sudo certbot certonly --standalone --agree-tos -m you@example.com -d cloudpi.example.com
+LE=/etc/letsencrypt/live/cloudpi.example.com
+sudo cp "$LE/cert.pem"    /home/cloudpiadmin/cloudpi/certs/cert.pem
+sudo cp "$LE/chain.pem"   /home/cloudpiadmin/cloudpi/certs/ca_bundle.pem
+sudo cp "$LE/privkey.pem" /home/cloudpiadmin/cloudpi/certs/privkey.pem
+sudo chown -R 1000:1000 /home/cloudpiadmin/cloudpi/certs
+```
+
+> The domain's A record must resolve to the Elastic IP **before** running this step, or Let's Encrypt's HTTP validation fails. The script does a best-effort `dig` check and warns on mismatch.
 
 ### Secrets fetch script (script step 10f)
 
@@ -322,12 +381,12 @@ Expected response: HTTP 200 with a JWT token.
 
 ### 7.1 Update image tags in docker-compose.yml
 
-**Recommended:** Re-run `deploy_interactive.sh`, re-run step 10c, and choose **option 2 — update image tags only**. Enter the new version (e.g. `v1.1.044`). The script replaces both image tags in the existing file without touching anything else.
+**Recommended:** Re-run `deploy_interactive.sh`, re-run step 10c, and choose **option 2 — update image tags only**. Enter the new version (e.g. `v1.1.048`). The script replaces both image tags in the existing file without touching anything else.
 
 Or manually with nano:
 ```bash
 sudo nano /home/cloudpiadmin/cloudpi/docker-compose.yml
-# Update both image tags to the new version, e.g. Cloudpi_v1.1.044
+# Update both image tags to the new version, e.g. Cloudpi_v1.1.048
 ```
 
 ### 7.2 Pull new images and restart
@@ -354,6 +413,67 @@ If migration fails and the container enters lockout:
 ---
 
 ## Troubleshooting
+
+### Provisioning fails: `InvalidKeyPair.NotFound`
+
+The key pair named in step 5 does not exist in AWS in the deploy region. Either create it in the AWS console (see [1.1 Create an EC2 Key Pair](#11-create-an-ec2-key-pair)) in the **same region** you deploy into, or let script step 5 **import** your local `.pem` / **create** a new pair when it prompts. Confirm it exists:
+
+```bash
+aws ec2 describe-key-pairs --key-names cloudpi-key --region us-east-1
+```
+
+### Provisioning fails: `UnauthorizedOperation` on `ec2:DescribeKeyPairs`
+
+The deploying IAM user lacks `ec2:DescribeKeyPairs`. The script warns and continues (the later `RunInstances` still validates the key), but to enable the pre-flight check, add the permission:
+
+```bash
+aws iam put-user-policy --user-name <your-iam-user> \
+  --policy-name EC2DescribeKeyPairs \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:DescribeKeyPairs","Resource":"*"}]}'
+```
+
+### DB password / baked-in datadir
+
+**Symptom:** `cloudpi-app` never becomes healthy; its log loops on `Waiting for MySQL database to be ready...` then `MySQL connection failed` / `Access denied for user 'masteradmin'`. Meanwhile `cloudpi-db` reports **healthy** (its `mysqladmin ping` doesn't authenticate).
+
+**Cause:** The prebuilt `cloudpi-db` image ships a **pre-initialized MySQL datadir**. Because `/var/lib/mysql` is already populated, MySQL **ignores** the `MYSQL_*` env vars on first boot, so `masteradmin@'%'` keeps the password baked into the image — not the one in your secrets.
+
+**Fix:** Script **step 10i** does this automatically (and step 11a's self-repair will trigger it). To do it manually — reset the password to match your secrets via a throwaway `--skip-grant-tables` container:
+
+```bash
+cd /home/cloudpiadmin/cloudpi
+DB_PW=$(/usr/local/bin/aws secretsmanager get-secret-value --region us-east-1 \
+  --secret-id cloudpi-secrets --query SecretString --output text \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['MYSQL_PASSWORD'])")
+VOL=$(sudo docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Name}}{{end}}{{end}}' cloudpi-db)
+IMG=$(sudo docker inspect -f '{{.Config.Image}}' cloudpi-db)
+
+sudo docker compose stop db
+sudo docker run --rm -d --name mysql-reset -v "$VOL":/var/lib/mysql \
+  --user mysql --entrypoint mysqld "$IMG" --skip-grant-tables --skip-networking
+sleep 8
+sudo docker exec mysql-reset mysql -e "FLUSH PRIVILEGES;
+  ALTER USER IF EXISTS 'masteradmin'@'%'         IDENTIFIED BY '${DB_PW}';
+  ALTER USER IF EXISTS 'masteradmin'@'localhost' IDENTIFIED BY '${DB_PW}';
+  FLUSH PRIVILEGES;"
+sudo docker stop mysql-reset
+sudo docker compose up -d
+```
+
+> ⚠ Do **not** run `docker compose down -v` to "fix" this — the `-v` deletes the volume and re-copies the same baked datadir, undoing any reset. The DB password reset survives a normal `down`/`up` because the named volume is preserved.
+
+### App crash-loops: `PermissionError: /var/log/pico/app.log`
+
+**Cause:** The app (Flask, UID 1000 in-container) writes its log to `/var/log/pico`, bind-mounted from the host. If the host directory is missing or owned by root, UID 1000 can't write and Flask crash-loops.
+
+**Fix:** Script **step 10h** creates it automatically. To fix manually on the instance:
+
+```bash
+sudo mkdir -p /var/log/pico
+sudo chown -R 1000:syslog /var/log/pico   # if the 'syslog' group is missing, use 1000:1000
+sudo chmod 2750 /var/log/pico
+cd /home/cloudpiadmin/cloudpi && sudo docker compose restart app
+```
 
 ### Permission denied writing files in /home/cloudpiadmin/cloudpi/
 
@@ -455,7 +575,7 @@ secrets:
 
 services:
   db:
-    image: cloudpi1/cloudpi:Cloudpi_db_v1.1.042
+    image: cloudpi1/cloudpi:Cloudpi_db_v1.1.048
     container_name: cloudpi-db
     restart: unless-stopped
     environment:
@@ -476,7 +596,7 @@ services:
       retries: 5
 
   app:
-    image: cloudpi1/cloudpi:Cloudpi_v1.1.042
+    image: cloudpi1/cloudpi:Cloudpi_v1.1.048
     container_name: cloudpi-app
     restart: unless-stopped
     depends_on:
@@ -526,6 +646,7 @@ networks:
 | `/usr/local/bin/cloudpi-fetch-secrets.sh` | Secrets fetch script (owned root, mode 755) |
 | `/etc/systemd/system/cloudpi-fetch-secrets.service` | Systemd unit: fetch secrets on boot |
 | `/etc/systemd/system/cloudpi-docker-compose.service` | Systemd unit: start containers |
+| `/var/log/pico/` | App JSON logs (bind-mounted into the container; owned UID `1000`, mode `2750`) |
 | `/var/log/cloudpi-bootstrap.log` | EC2 user-data bootstrap log |
 | `/var/log/cloudpi-bootstrap-done` | Marker file created when bootstrap completes |
 

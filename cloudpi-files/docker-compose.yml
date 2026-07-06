@@ -1,6 +1,6 @@
 services:
   db:
-    image: cloudpi1/cloudpi:latest-db
+    image: cloudpi1/cloudpi:Cloudpi_db_v1.1.048
     container_name: cloudpi-db
     volumes:
       - mysql_data:/var/lib/mysql
@@ -37,7 +37,7 @@ services:
           memory: 4G
 
   app:
-    image: cloudpi1/cloudpi:latest-app
+    image: cloudpi1/cloudpi:Cloudpi_v1.1.048
     container_name: cloudpi-app
     hostname: cloudpi-app
     restart: always
