@@ -764,7 +764,13 @@ if should_run STEP_6 "EC2 provisioned (IP: ${PUBLIC_IP:-none})"; then
     ask _data_gb "Data disk size in GB (app + Docker + DB, mounted at /data)" "64"
     [[ "$_data_gb" =~ ^[0-9]+$ ]] || { warn "Not a number — using 64 GB."; _data_gb=64; }
 
-    echo "     This creates: IAM role, security group (22/80/443), EC2 t3.large,"
+    # Instance size. Default m5.2xlarge (8 vCPU / 32 GB) — sized for the full
+    # CloudPi app + DB + Docker workload. Accepts any valid EC2 type (e.g.
+    # t3.large, m5.xlarge, m5.4xlarge). deploy_aws_ec2.py reads INSTANCE_TYPE.
+    ask _inst_type "EC2 instance type" "${INSTANCE_TYPE:-m5.2xlarge}"
+    [[ "$_inst_type" =~ ^[a-z0-9]+\.[a-z0-9]+$ ]] || { warn "'${_inst_type}' looks unusual — using m5.2xlarge."; _inst_type="m5.2xlarge"; }
+
+    echo "     This creates: IAM role, security group (22/80/443), EC2 ${_inst_type},"
     echo "     a ${_root_gb} GB root (OS) + ${_data_gb} GB data disk (/data), and an Elastic IP"
     echo "     — in region ${REGION}."
     echo
@@ -774,11 +780,11 @@ if should_run STEP_6 "EC2 provisioned (IP: ${PUBLIC_IP:-none})"; then
     ask _popt "Choice" "1"
 
     if [[ "${_popt:-1}" == "1" ]]; then
-        info "Running deploy_aws_ec2.py in region ${REGION} (data disk: ${_data_gb} GB) ..."
-        # REGION/TF_SCRIPT/DATA_VOLUME_SIZE are exported so deploy_aws_ec2.py
-        # provisions the right infra and data-disk size.
+        info "Running deploy_aws_ec2.py in region ${REGION} (${_inst_type}, data disk: ${_data_gb} GB) ..."
+        # REGION/TF_SCRIPT/DATA_VOLUME_SIZE/INSTANCE_TYPE are exported so
+        # deploy_aws_ec2.py provisions the right infra, data-disk, and size.
         TF_SCRIPT="$(st_get TF_SCRIPT)"
-        _out=$(REGION="$REGION" TF_SCRIPT="$TF_SCRIPT" DATA_VOLUME_SIZE="$_data_gb" \
+        _out=$(REGION="$REGION" TF_SCRIPT="$TF_SCRIPT" DATA_VOLUME_SIZE="$_data_gb" INSTANCE_TYPE="$_inst_type" \
                python3 "$SCRIPT_DIR/deploy_aws_ec2.py" 2>&1 | tee /dev/stderr)
         PUBLIC_IP=$(echo "$_out" | grep -E "Public IP" | head -1 | awk '{print $NF}')
         [[ -n "$PUBLIC_IP" ]] || die "Could not capture Public IP from deploy_aws_ec2.py output."
@@ -1048,6 +1054,10 @@ if should_run STEP_10C "docker-compose.yml configured"; then
     info "Current image tags on EC2:"
     ssh_run "grep 'image:' /home/cloudpiadmin/cloudpi/docker-compose.yml 2>/dev/null || echo '     (none found)'"
     echo
+    # Re-runnable menu: if option 2 is picked but the instance has no
+    # docker-compose.yml yet, we warn and loop back to the menu instead of
+    # aborting the whole deploy — so the user can pick option 1 (install bundle).
+    while true; do
     echo "     Options:"
     echo "       1) Install bundle docker-compose.yml (from cloudpi-files, version-tagged)  (default)"
     echo "       2) Update image tags only in existing docker-compose.yml"
@@ -1056,7 +1066,16 @@ if should_run STEP_10C "docker-compose.yml configured"; then
 
     if [[ "${_copt:-1}" == "3" ]]; then
         ok "docker-compose.yml step skipped."
+        break
     else
+        # For option 2 there must already be a compose file to edit. Check first
+        # (in an `if !` so set -e does not abort) and re-present the menu if absent.
+        if [[ "${_copt:-1}" == "2" ]] && ! ssh_run "test -f /home/cloudpiadmin/cloudpi/docker-compose.yml"; then
+            warn "No docker-compose.yml on the instance yet — choose option 1 to install the bundle first."
+            echo
+            continue
+        fi
+
         ask _ver "Target release version (e.g. v1.1.048)" "v1.1.048"
         [[ "$_ver" =~ ^v?[0-9]+(\.[0-9]+)*$ ]] || warn "Version '${_ver}' looks unusual — continuing anyway."
 
@@ -1096,7 +1115,9 @@ REMOTE
                      sudo chown cloudpiadmin:cloudpiadmin /home/cloudpiadmin/cloudpi/docker-compose.yml"
             ok "docker-compose.yml installed from bundle (version: ${_ver})."
         fi
+        break
     fi
+    done
     st_set STEP_10C "done"
 fi
 

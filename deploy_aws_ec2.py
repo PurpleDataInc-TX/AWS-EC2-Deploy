@@ -30,7 +30,7 @@ from botocore.exceptions import ClientError
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 REGION               = os.getenv("REGION",               "us-east-1")
-INSTANCE_TYPE        = os.getenv("INSTANCE_TYPE",        "t3.large")   # 2 vCPU / 8 GB
+INSTANCE_TYPE        = os.getenv("INSTANCE_TYPE",        "m5.2xlarge")  # 8 vCPU / 32 GB
 ROOT_VOLUME_SIZE     = int(os.getenv("ROOT_VOLUME_SIZE", "30"))        # GB - OS only
 DATA_VOLUME_SIZE     = int(os.getenv("DATA_VOLUME_SIZE", "64"))        # GB - Docker + app data, mounted at /data
 KEY_PAIR_NAME        = os.getenv("KEY_PAIR_NAME",        "cloudpi-key")
